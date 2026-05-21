@@ -1,0 +1,7 @@
+begin
+  a = 1;
+  if a >= 1 then begin
+    b = a + 2;
+  end;
+  while b <> 0 do b = b - 1;
+end;

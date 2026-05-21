@@ -1,0 +1,14 @@
+# Build outputs
+*.exe
+*.obj
+
+# Auto-generated parser files
+Exp2_Parser.tab.c
+Exp2_Parser.tab.h
+
+# Temporary editor/system files
+*.tmp
+*.log
+Thumbs.db
+.DS_Store
+
