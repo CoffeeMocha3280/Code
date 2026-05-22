@@ -64,6 +64,45 @@ static void generate_line_code(CodeBuffer *buffer, const Node *node);
 /* 根据程序结点递归生成全部三地址码。 */
 static void generate_program_code(CodeBuffer *buffer, const Node *node);
 
+/* 判断一行是否是标签定义，例如 L3: */
+static int parse_label_line(const char *line, char *label, size_t size);
+
+/* 判断一行是否是无条件跳转，例如 goto L3 */
+static int parse_plain_goto_line(const char *line, char *label, size_t size);
+
+/* 解析一行中的跳转目标，支持 goto 和 if ... goto 两种形式。 */
+static int parse_any_goto_target(const char *line, char *label, size_t size);
+
+/* 在标签映射表中查找某个旧标签最终应该对应到哪个新标签。 */
+static const char *resolve_label_alias(const char *label,
+                                       char old_labels[][32],
+                                       char new_labels[][32],
+                                       int alias_count);
+
+/* 在一对一重命名表里直接查找新标签，不做链式追踪。 */
+static const char *lookup_direct_label(const char *label,
+                                       char old_labels[][32],
+                                       char new_labels[][32],
+                                       int label_count);
+
+/* 把一行三地址码中的跳转目标替换成优化后的标签名。 */
+static char *rewrite_line_target(const char *line,
+                                 char old_labels[][32],
+                                 char new_labels[][32],
+                                 int alias_count);
+
+/* 把一行三地址码中的跳转目标按最终重编号结果直接替换。 */
+static char *rewrite_line_target_direct(const char *line,
+                                        char old_labels[][32],
+                                        char new_labels[][32],
+                                        int label_count);
+
+/* 对已经生成的三地址码做简单标签优化。 */
+static void optimize_labels(CodeBuffer *buffer);
+
+/* 判断某个标签位置前面是否可能有顺序落入它的执行流。 */
+static int label_has_fallthrough_entry(CodeBuffer *buffer, int label_index);
+
 static void code_buffer_init(CodeBuffer *buffer) {
     buffer->lines = NULL;
     buffer->count = 0;
@@ -410,12 +449,449 @@ static void generate_program_code(CodeBuffer *buffer, const Node *node) {
     }
 }
 
+static int parse_label_line(const char *line, char *label, size_t size) {
+    size_t length;
+
+    if (line == NULL) {
+        return 0;
+    }
+
+    length = strlen(line);
+    if (length < 2 || line[length - 1] != ':') {
+        return 0;
+    }
+
+    if (length >= size) {
+        return 0;
+    }
+
+    memcpy(label, line, length - 1);
+    label[length - 1] = '\0';
+    return 1;
+}
+
+static int parse_plain_goto_line(const char *line, char *label, size_t size) {
+    if (line == NULL || strncmp(line, "goto ", 5) != 0) {
+        return 0;
+    }
+
+    snprintf(label, size, "%s", line + 5);
+    return 1;
+}
+
+static int parse_any_goto_target(const char *line, char *label, size_t size) {
+    const char *goto_pos;
+
+    if (parse_plain_goto_line(line, label, size)) {
+        return 1;
+    }
+
+    goto_pos = strstr(line, " goto ");
+    if (goto_pos == NULL) {
+        return 0;
+    }
+
+    snprintf(label, size, "%s", goto_pos + 6);
+    return 1;
+}
+
+static const char *resolve_label_alias(const char *label,
+                                       char old_labels[][32],
+                                       char new_labels[][32],
+                                       int alias_count) {
+    const char *current;
+    int step;
+
+    current = label;
+    for (step = 0; step < alias_count; step++) {
+        int index;
+        int changed = 0;
+
+        for (index = 0; index < alias_count; index++) {
+            if (strcmp(old_labels[index], current) == 0) {
+                current = new_labels[index];
+                changed = 1;
+                break;
+            }
+        }
+
+        if (!changed) {
+            break;
+        }
+    }
+
+    return current;
+}
+
+static const char *lookup_direct_label(const char *label,
+                                       char old_labels[][32],
+                                       char new_labels[][32],
+                                       int label_count) {
+    int index;
+
+    for (index = 0; index < label_count; index++) {
+        if (strcmp(old_labels[index], label) == 0) {
+            return new_labels[index];
+        }
+    }
+
+    return label;
+}
+
+static char *rewrite_line_target(const char *line,
+                                 char old_labels[][32],
+                                 char new_labels[][32],
+                                 int alias_count) {
+    char target[32];
+    const char *resolved;
+    const char *goto_pos;
+    char rebuilt[512];
+
+    if (!parse_any_goto_target(line, target, sizeof(target))) {
+        return duplicate_text(line);
+    }
+
+    resolved = resolve_label_alias(target, old_labels, new_labels, alias_count);
+
+    if (strncmp(line, "goto ", 5) == 0) {
+        snprintf(rebuilt, sizeof(rebuilt), "goto %s", resolved);
+        return duplicate_text(rebuilt);
+    }
+
+    goto_pos = strstr(line, " goto ");
+    if (goto_pos == NULL) {
+        return duplicate_text(line);
+    }
+
+    snprintf(rebuilt, sizeof(rebuilt), "%.*s goto %s",
+             (int)(goto_pos - line), line, resolved);
+    return duplicate_text(rebuilt);
+}
+
+static char *rewrite_line_target_direct(const char *line,
+                                        char old_labels[][32],
+                                        char new_labels[][32],
+                                        int label_count) {
+    char target[32];
+    const char *resolved;
+    const char *goto_pos;
+    char rebuilt[512];
+
+    if (!parse_any_goto_target(line, target, sizeof(target))) {
+        return duplicate_text(line);
+    }
+
+    resolved = lookup_direct_label(target, old_labels, new_labels, label_count);
+
+    if (strncmp(line, "goto ", 5) == 0) {
+        snprintf(rebuilt, sizeof(rebuilt), "goto %s", resolved);
+        return duplicate_text(rebuilt);
+    }
+
+    goto_pos = strstr(line, " goto ");
+    if (goto_pos == NULL) {
+        return duplicate_text(line);
+    }
+
+    snprintf(rebuilt, sizeof(rebuilt), "%.*s goto %s",
+             (int)(goto_pos - line), line, resolved);
+    return duplicate_text(rebuilt);
+}
+
+static int label_has_fallthrough_entry(CodeBuffer *buffer, int label_index) {
+    int index;
+    char ignored_label[32];
+    char ignored_target[32];
+
+    index = label_index - 1;
+    while (index >= 0) {
+        if (!parse_label_line(buffer->lines[index], ignored_label, sizeof(ignored_label))) {
+            break;
+        }
+        index--;
+    }
+
+    /* 程序开头直接就是标签时，不存在从上一条语句自然落入的问题。 */
+    if (index < 0) {
+        return 0;
+    }
+
+    /* 如果前一条真正可执行语句本身就是无条件跳转，也不会自然落入当前标签。 */
+    if (parse_plain_goto_line(buffer->lines[index], ignored_target, sizeof(ignored_target))) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static void optimize_labels(CodeBuffer *buffer) {
+    char (*alias_old)[32];
+    char (*alias_new)[32];
+    char (*rename_old)[32];
+    char (*rename_new)[32];
+    char (*used_labels)[32];
+    char **new_lines;
+    int alias_count;
+    int new_count;
+    int rename_count;
+    int used_count;
+    int index;
+
+    if (buffer->count == 0) {
+        return;
+    }
+
+    alias_old = (char (*)[32])malloc(sizeof(char[32]) * buffer->count);
+    alias_new = (char (*)[32])malloc(sizeof(char[32]) * buffer->count);
+    rename_old = (char (*)[32])malloc(sizeof(char[32]) * buffer->count);
+    rename_new = (char (*)[32])malloc(sizeof(char[32]) * buffer->count);
+    used_labels = (char (*)[32])malloc(sizeof(char[32]) * buffer->count);
+    new_lines = (char **)malloc(sizeof(char *) * buffer->count);
+    if (alias_old == NULL || alias_new == NULL || rename_old == NULL ||
+        rename_new == NULL || used_labels == NULL || new_lines == NULL) {
+        fprintf(stderr, "Out of memory.\n");
+        exit(1);
+    }
+
+    /* 第一步：把连续出现的空标签合并到后一个真实落点标签上。 */
+    alias_count = 0;
+    for (index = 0; index < buffer->count - 1; index++) {
+        char current_label[32];
+        char next_label[32];
+
+        if (parse_label_line(buffer->lines[index], current_label, sizeof(current_label)) &&
+            parse_label_line(buffer->lines[index + 1], next_label, sizeof(next_label))) {
+            snprintf(alias_old[alias_count], sizeof(alias_old[alias_count]), "%s", current_label);
+            snprintf(alias_new[alias_count], sizeof(alias_new[alias_count]), "%s", next_label);
+            alias_count++;
+        }
+    }
+
+    /* 第二步：删除被合并掉的标签定义，并同步改写所有跳转目标。 */
+    new_count = 0;
+    for (index = 0; index < buffer->count; index++) {
+        char label_name[32];
+
+        if (parse_label_line(buffer->lines[index], label_name, sizeof(label_name))) {
+            const char *resolved = resolve_label_alias(label_name, alias_old, alias_new, alias_count);
+            if (strcmp(label_name, resolved) != 0) {
+                continue;
+            }
+            new_lines[new_count++] = duplicate_text(buffer->lines[index]);
+        }
+        else {
+            new_lines[new_count++] = rewrite_line_target(buffer->lines[index],
+                                                         alias_old,
+                                                         alias_new,
+                                                         alias_count);
+        }
+    }
+
+    for (index = 0; index < buffer->count; index++) {
+        free(buffer->lines[index]);
+    }
+    free(buffer->lines);
+    buffer->lines = new_lines;
+    buffer->count = new_count;
+    buffer->capacity = new_count;
+
+    /* 第三步：删除“goto 后面立刻就是目标标签”的无意义跳转。 */
+    new_lines = (char **)malloc(sizeof(char *) * buffer->count);
+    if (new_lines == NULL) {
+        fprintf(stderr, "Out of memory.\n");
+        exit(1);
+    }
+
+    new_count = 0;
+    for (index = 0; index < buffer->count; index++) {
+        char goto_target[32];
+        char next_label[32];
+
+        if (index + 1 < buffer->count &&
+            parse_plain_goto_line(buffer->lines[index], goto_target, sizeof(goto_target)) &&
+            parse_label_line(buffer->lines[index + 1], next_label, sizeof(next_label)) &&
+            strcmp(goto_target, next_label) == 0) {
+            free(buffer->lines[index]);
+            continue;
+        }
+
+        new_lines[new_count++] = buffer->lines[index];
+    }
+
+    free(buffer->lines);
+    buffer->lines = new_lines;
+    buffer->count = new_count;
+    buffer->capacity = new_count;
+
+    /* 第四步：消除“标签后面只有一条 goto”的跳板标签。
+     * 只有当这个标签不会被上一条语句顺序落入时，才可以安全删除。 */
+    alias_count = 0;
+    for (index = 0; index < buffer->count - 1; index++) {
+        char label_name[32];
+        char goto_target[32];
+
+        if (parse_label_line(buffer->lines[index], label_name, sizeof(label_name)) &&
+            parse_plain_goto_line(buffer->lines[index + 1], goto_target, sizeof(goto_target)) &&
+            !label_has_fallthrough_entry(buffer, index)) {
+            snprintf(alias_old[alias_count], sizeof(alias_old[alias_count]), "%s", label_name);
+            snprintf(alias_new[alias_count], sizeof(alias_new[alias_count]), "%s", goto_target);
+            alias_count++;
+        }
+    }
+
+    new_lines = (char **)malloc(sizeof(char *) * buffer->count);
+    if (new_lines == NULL) {
+        fprintf(stderr, "Out of memory.\n");
+        exit(1);
+    }
+
+    new_count = 0;
+    for (index = 0; index < buffer->count; index++) {
+        char label_name[32];
+        char goto_target[32];
+
+        if (parse_label_line(buffer->lines[index], label_name, sizeof(label_name))) {
+            const char *resolved = resolve_label_alias(label_name, alias_old, alias_new, alias_count);
+            if (strcmp(label_name, resolved) != 0) {
+                free(buffer->lines[index]);
+                continue;
+            }
+        }
+
+        if (index > 0 &&
+            parse_plain_goto_line(buffer->lines[index], goto_target, sizeof(goto_target)) &&
+            parse_label_line(buffer->lines[index - 1], label_name, sizeof(label_name))) {
+            const char *resolved = resolve_label_alias(label_name, alias_old, alias_new, alias_count);
+            if (strcmp(label_name, resolved) != 0) {
+                free(buffer->lines[index]);
+                continue;
+            }
+        }
+
+        new_lines[new_count++] = rewrite_line_target(buffer->lines[index],
+                                                     alias_old,
+                                                     alias_new,
+                                                     alias_count);
+        free(buffer->lines[index]);
+    }
+
+    free(buffer->lines);
+    buffer->lines = new_lines;
+    buffer->count = new_count;
+    buffer->capacity = new_count;
+
+    /* 第五步：删除没有任何跳转会用到的标签。 */
+    used_count = 0;
+    for (index = 0; index < buffer->count; index++) {
+        char target[32];
+        int exists;
+        int used_index;
+
+        if (!parse_any_goto_target(buffer->lines[index], target, sizeof(target))) {
+            continue;
+        }
+
+        exists = 0;
+        for (used_index = 0; used_index < used_count; used_index++) {
+            if (strcmp(used_labels[used_index], target) == 0) {
+                exists = 1;
+                break;
+            }
+        }
+
+        if (!exists) {
+            snprintf(used_labels[used_count], sizeof(used_labels[used_count]), "%s", target);
+            used_count++;
+        }
+    }
+
+    new_lines = (char **)malloc(sizeof(char *) * buffer->count);
+    if (new_lines == NULL) {
+        fprintf(stderr, "Out of memory.\n");
+        exit(1);
+    }
+
+    new_count = 0;
+    for (index = 0; index < buffer->count; index++) {
+        char label_name[32];
+        int exists;
+        int used_index;
+
+        if (!parse_label_line(buffer->lines[index], label_name, sizeof(label_name))) {
+            new_lines[new_count++] = buffer->lines[index];
+            continue;
+        }
+
+        exists = 0;
+        for (used_index = 0; used_index < used_count; used_index++) {
+            if (strcmp(used_labels[used_index], label_name) == 0) {
+                exists = 1;
+                break;
+            }
+        }
+
+        if (exists) {
+            new_lines[new_count++] = buffer->lines[index];
+        }
+        else {
+            free(buffer->lines[index]);
+        }
+    }
+
+    free(buffer->lines);
+    buffer->lines = new_lines;
+    buffer->count = new_count;
+    buffer->capacity = new_count;
+
+    /* 第六步：重新连续编号标签，避免删除冗余标签后出现编号断裂。 */
+    rename_count = 0;
+    for (index = 0; index < buffer->count; index++) {
+        char label_name[32];
+        char new_label_name[32];
+
+        if (parse_label_line(buffer->lines[index], label_name, sizeof(label_name))) {
+            snprintf(rename_old[rename_count], sizeof(rename_old[rename_count]), "%s", label_name);
+            snprintf(new_label_name, sizeof(new_label_name), "L%d", rename_count);
+            snprintf(rename_new[rename_count], sizeof(rename_new[rename_count]), "%s", new_label_name);
+            rename_count++;
+        }
+    }
+
+    for (index = 0; index < buffer->count; index++) {
+        char label_name[32];
+        char rewritten[64];
+        char *updated_line;
+
+        if (parse_label_line(buffer->lines[index], label_name, sizeof(label_name))) {
+            const char *resolved = lookup_direct_label(label_name, rename_old, rename_new, rename_count);
+            snprintf(rewritten, sizeof(rewritten), "%s:", resolved);
+            free(buffer->lines[index]);
+            buffer->lines[index] = duplicate_text(rewritten);
+        }
+        else {
+            updated_line = rewrite_line_target_direct(buffer->lines[index],
+                                                      rename_old,
+                                                      rename_new,
+                                                      rename_count);
+            free(buffer->lines[index]);
+            buffer->lines[index] = updated_line;
+        }
+    }
+
+    free(alias_old);
+    free(alias_new);
+    free(rename_old);
+    free(rename_new);
+    free(used_labels);
+}
+
 void Exp3_PrintThreeAddressCode(const Node *root) {
     int index;
     CodeBuffer buffer;
 
     code_buffer_init(&buffer);
     generate_program_code(&buffer, root);
+    optimize_labels(&buffer);
 
     printf("Three-address code:\n");
     for (index = 0; index < buffer.count; index++) {
